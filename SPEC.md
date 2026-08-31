@@ -53,10 +53,18 @@ MSK topic ──► events_kafka (Kafka engine, handle_error_mode='stream')
 19,131 events/s**, with a laptop-side ceiling of **~108,000 events/s** — 5.4× the requirement
 (§14.1). Cost is out of scope.
 
-**The one open question.** Whether the Kafka engine commits offsets only *after* MV target
-writes succeed. It is the linchpin of the zero-loss claim and it cannot be answered without a
-broker reachable from ClickHouse Cloud. `scripts/verify-kafka-commit-semantics.sql` is a
-runnable, falsifiable test — run it against MSK first. Everything else in §16 is verified.
+**The zero-loss linchpin is answered.** The Kafka engine commits offsets **only after
+materialized-view target writes succeed**. Verified against Redpanda on ClickHouse 26.4.1 (the
+Cloud version) and 26.8.1: while the MV target rejected every row, `num_commits` stayed at 0 and
+the offset never advanced while `num_messages_read` climbed — the consumer retried the same
+block. On recovery, all 100 records landed with **0 missing and 0 duplicates**. R9 rests on the
+engine's own guarantees.
+
+**Implementation.** `ccb-v2/`: schema, Kafka DDL, a batch producer with fault injection, and 19
+explicit validations. Building it corrected four bugs in this document's SQL — see §16.
+
+**Remaining unknown.** Kafka-engine *support posture* on ClickHouse Cloud: the DDL is accepted
+and `system.kafka_consumers` populates, but production support is a question for CH engineering.
 
 ---
 
@@ -614,11 +622,33 @@ WITH
     -- fall through to the tryDecrypt/ifNull path below, never raise. dictGet would
     -- throw, and because this MV sits under the Kafka landing chain the exception
     -- would propagate to the consumer and stall the partition on a vault blip.
-    dictGetOrDefault(ccb_v2.dict_vault_keys, 'key_hex', key_epoch, '') AS key_hex,
-    -- tryDecrypt returns Nullable(String), and ClickHouse rejects Nullable inside
-    -- array functions: "Nested type Array(String) cannot be inside Nullable type".
+    dictGetOrDefault(ccb_v2.dict_vault_keys, 'key_hex', key_epoch, '') AS k_raw,
+    base64Decode(iv)                                                   AS iv_raw,
+    base64Decode(payload_ct)                                           AS ct_raw,
+    -- ══ CORRECTED AFTER IMPLEMENTATION ══
+    -- tryDecrypt does NOT swallow everything. It returns NULL for a WRONG key of
+    -- the right size, but it THROWS on:
+    --     key size != 32      "Invalid key size: 0 expected 32"
+    --     IV size 0           "Invalid IV size 0 != expected size 12"
+    --     garbage ciphertext  "Encrypted data is smaller than the size of ..."
+    -- The earlier draft passed dictGetOrDefault(..., '') straight in, so a MISSING
+    -- VAULT KEY raised — propagating through events_raw to the consumer, which
+    -- never commits and retries forever. A stalled partition: exactly what §6.0
+    -- rule 2 exists to prevent. Observed in the build before the fix.
+    --
+    -- Guarding with if() is insufficient — short-circuit evaluation is not
+    -- guaranteed under vectorised execution. Every argument is instead coerced to
+    -- a STRUCTURALLY VALID shape: a missing key becomes 32 zero bytes, a valid
+    -- size that cannot decrypt, so tryDecrypt returns NULL. Verified non-throwing
+    -- across all 8 failure modes.
+    if(length(k_raw)  = 64, k_raw,  repeat('0', 64))         AS key_hex,
+    if(length(iv_raw) = 12, iv_raw, unhex(repeat('00', 12))) AS iv_bytes,
+    if(length(ct_raw) > 16, ct_raw, unhex(repeat('00', 32))) AS ct_bytes,
+    -- The mode MUST be a literal. Passing the `cipher` COLUMN fails with "illegal
+    -- type ... as 1st argument 'mode'". No per-row cipher agility, so `cipher` is
+    -- ADVISORY and a validation asserts it.
     ifNull(
-        tryDecrypt(cipher, base64Decode(payload_ct), unhex(key_hex), base64Decode(iv)),
+        tryDecrypt('aes-256-gcm', ct_bytes, unhex(key_hex), iv_bytes),
         '{"events":[]}'
     ) AS plain
 SELECT
@@ -706,7 +736,10 @@ SELECT toStartOfMinute(ts) AS minute, channel,
 FROM ccb_v2.customer_events GROUP BY minute, channel;
 
 CREATE MATERIALIZED VIEW ccb_v2.mv_consent_state TO ccb_v2.consent_state AS
-SELECT customer_id, ts,
+-- CORRECTED: event_id must be in the projection AND the target sort key
+-- (customer_id, consent_kind, ts, event_id). Without it, two DISTINCT events for
+-- one customer in the same millisecond collapse — dedup causing data loss.
+SELECT customer_id, ts, event_id,
        c.kind::LowCardinality(String) AS consent_kind,
        c.granted::Bool                AS granted
 FROM ccb_v2.customer_events
@@ -1088,11 +1121,20 @@ rows downstream (by design, §6.4). The envelope's `n_events` is the producer's 
 declaration, which makes this checkable.
 
 ```sql
-CREATE TABLE ccb_v2.batch_landed (batch_id String, landed UInt64)
-ENGINE = SummingMergeTree ORDER BY batch_id;
+-- CORRECTED AFTER IMPLEMENTATION. As a SummingMergeTree fed by count(), one
+-- replayed envelope took customer_events 100 -> 200 AND batch_landed 100 -> 200
+-- (MVs fire per block, before dedup), so this check reported a false discrepancy
+-- in the WRONG direction on a pipeline that had lost nothing. uniqExact over
+-- event_id is immune: a replayed event carries the same event_id.
+CREATE TABLE ccb_v2.batch_landed
+(
+    batch_id     String,
+    landed_state AggregateFunction(uniqExact, String)
+)
+ENGINE = AggregatingMergeTree ORDER BY batch_id;
 
 CREATE MATERIALIZED VIEW ccb_v2.mv_batch_landed TO ccb_v2.batch_landed AS
-SELECT batch_id, toUInt64(count()) AS landed
+SELECT batch_id, uniqExactState(event_id) AS landed_state
 FROM ccb_v2.customer_events GROUP BY batch_id;
 
 CREATE VIEW ccb_v2.v_batch_reconciliation AS
@@ -1106,7 +1148,7 @@ SELECT
 FROM ccb_v2.events_raw AS r
 LEFT JOIN
 (
-    SELECT batch_id, sum(landed) AS landed FROM ccb_v2.batch_landed GROUP BY batch_id
+    SELECT batch_id, uniqExactMerge(landed_state) AS landed FROM ccb_v2.batch_landed GROUP BY batch_id
 ) AS b USING (batch_id)
 WHERE r.produced_at >= now() - INTERVAL 30 MINUTE
   AND r.produced_at <  now() - INTERVAL 1 MINUTE
@@ -1242,11 +1284,12 @@ insert errors at every rate, 6–13 active parts, no merge pressure, and
 | Risk | Impact | Mitigation |
 |---|---|---|
 | **Kafka engine support posture on Cloud** | could invalidate the whole ingest choice | **DDL verified accepted; production support is an open question for CH engineering** |
-| **Offset-commit ordering vs MV success** | if offsets commit before the MV target write, R9 is unachievable | **unverified — run `scripts/verify-kafka-commit-semantics.sql` against MSK.** §13.1 detects it either way |
+| ~~Offset-commit ordering vs MV success~~ | — | **ANSWERED: commits only AFTER MV success.** Verified on 26.4.1 and 26.8.1 against Redpanda: while the target rejected, `num_commits=0` and the offset never advanced; on recovery all 100 records landed with **0 missing, 0 duplicates** |
 | `kafka_flush_interval_ms` left at default | silently misses the SLO by 7× (7500 ms) | set explicitly (§7.1); assert on `latency_1s` p99 continuously |
 | Consumer competes with query workload | query latency regression at high ingest | negligible at 200 rec/s; watch `system.processes` under load |
 | Poison block stalls a partition | ingest halts for that partition | §6.0 rule 2: the Kafka MV cannot throw; `handle_error_mode='stream'` routes to DLQ |
-| Vault outage cascades to consumer stall | ingest halts entirely | `dictGetOrDefault` + long `LIFETIME` (§6.4); alert on `system.dictionaries.last_exception` |
+| Vault outage cascades to consumer stall | ingest halts entirely | argument coercion (§6.4) — `dictGetOrDefault` ALONE IS NOT ENOUGH, it throws on a 0-byte key; alert on `system.dictionaries.last_exception` |
+| **Dictionary state is per-node** | first batches of a new epoch decrypt to zero rows on a stale node | measured: reload hit one node, a query another (2 elements vs 4 in the vault); self-corrected on `LIFETIME`. Keep `LIFETIME` well under the 300s epoch |
 | Any future MV added to the Kafka chain throws | reintroduces the stall risk | runbook rule: MVs in this chain must be non-throwing by construction |
 | Consumer scaling is manual | cannot absorb a 10× burst | `kafka_num_consumers` ≤ 24; add tables in the same group |
 | `FINAL` on the hot read path | latency cost not yet budgeted | measure before go-live; consider `argMax` collapse instead |
@@ -1264,7 +1307,7 @@ working.
 
 | # | Question | How |
 |---|---|---|
-| A1 | Does the Kafka engine commit offsets only after MV target writes succeed? | `scripts/verify-kafka-commit-semantics.sql` against MSK. A negative answer means R9 cannot rest on the engine alone |
+| ~~A1~~ | ~~Does the Kafka engine commit offsets only after MV target writes succeed?~~ | **RESOLVED — YES.** 0 commits while rejecting; 0 missing, 0 duplicates on recovery. Verified on 26.4.1 and 26.8.1 |
 | A2 | Is the Kafka engine supported for production on ClickHouse Cloud? | CH engineering |
 | A3 | Is plaintext PII at rest acceptable, or is the §5.5 variant required? | security review |
 
@@ -1338,6 +1381,58 @@ assumed. Items *not* verified are called out in §14.2.
 | Native `JSON` cast + dynamic paths (`j.customer.risk.score`) | works |
 | JSON array junction `ARRAY JOIN j.devices[] AS d` | works; **`[]` suffix required** |
 | `toStartOfInterval(now(), INTERVAL 300 SECOND)` epoch | `1787943000` |
+
+**Offset-commit ordering — the zero-loss linchpin (Redpanda + ClickHouse 26.4.1 and 26.8.1)**
+
+| Observation | Result |
+|---|---|
+| While the MV target rejected every row | `num_commits = 0`, offset never advanced past one block |
+| `num_messages_read` in that window | climbed 70 → 230 → 400: the consumer retried the same block |
+| Rows reaching the target | 0 |
+| After the constraint was dropped | offset 10 → 100, commits 0 → 10 |
+| Records recovered | **100 of 100 — 0 missing** |
+| Duplicates from the retry loop | **0** |
+| Consistency across versions | identical on 26.4.1 (Cloud's version) and 26.8.1 |
+
+**Corrected by implementation** (four bugs in earlier drafts of this document)
+
+| Finding | Consequence |
+|---|---|
+| `tryDecrypt` THROWS on key size != 32, IV size 0, garbage ciphertext | a missing vault key would have stalled a partition; arguments now coerced (§6.4) |
+| `tryDecrypt` mode must be a LITERAL, not a column | no per-row cipher agility; `cipher` is advisory and asserted |
+| `SummingMergeTree` + `count()` for `batch_landed` double-counts a replay | false "landed exceeds declared" on a healthy pipeline; now `uniqExactState(event_id)` |
+| `consent_state` key `(customer_id, consent_kind, ts)` too coarse | collapses distinct same-millisecond events; `event_id` added |
+
+**Measured hazards**
+
+| Check | Result |
+|---|---|
+| MV target failure propagates to writer | yes — `while pushing to view` |
+| Source insert rolled back when MV fails | **no** — source keeps the row, target does not |
+| MV fires again on replay | yes — `customer_events` 100 → 200; `FINAL` collapsed to 100 |
+| Dictionary state per-node after `SYSTEM RELOAD` | yes — 2 elements vs 4 in the vault; self-corrected on `LIFETIME` |
+| Coerced decrypt expression across 8 failure modes | **0 throws** |
+| `stream_flush_interval_ms` on a stock 26.4.1 | **7500 ms** — confirmed off-Cloud too |
+
+**Validations proven to fire (fault injection)**
+
+| Injection | Detected by | Observed |
+|---|---|---|
+| no vault key for the epoch | `EPOCHKEY`, `RECON` | `declared=50 landed=0 key=NO`; insert clean, no exception |
+| 5 skipped offsets | `CONTINUITY` | `p3 missing 5` |
+| `cipher='aes-128-cbc'` | `CIPHER` | `ciphers seen: aes-256-gcm, aes-128-cbc` |
+| envelope replayed | `DEDUP` | `rows=200 distinct=100 FINAL=100` — absorbed |
+| Kafka table without `kafka_flush_interval_ms` | `KAFKA_FLUSH` | `bad=1 — will inherit 7500ms` (negative control) |
+| consumer exceptions in the reject window | `KAFKA_CONSUMERS` | `exception_count=10`, `rebalances=13` |
+
+**End-to-end proven**
+
+| Check | Result |
+|---|---|
+| encrypt in Node → dictionary key → decrypt → explode → JSON column | 12 batches → 1,200 events, exact |
+| decrypt amortisation | **100× per decrypt**, measured |
+| `ARRAY JOIN payload.consents[]` | 1,200 events → 2,400 consent rows |
+| Validation suite | **17 pass, 0 fail, 2 skip** on Cloud; both Kafka checks executed locally |
 
 **Performance (latency test, §14.1)**
 
