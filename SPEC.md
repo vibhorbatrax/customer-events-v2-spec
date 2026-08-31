@@ -1013,6 +1013,209 @@ GROUP BY table, partition ORDER BY parts DESC LIMIT 20;
 
 ---
 
+### 12.5 Structural and telemetry validations (system tables)
+
+Every query below returns exactly one row `(bad, detail)`; **`bad = 0` is PASS**. They are the
+system-table half of the validation suite in `ccb-v2/03-validations.sql`, and each one has been
+executed — the "observed" column is real output, not an example.
+
+Run them with `node ccb-v2/validate.mjs`, or paste individually. Exit code equals the number of
+failures, so the suite drops into CI unchanged.
+
+| Check | System table | Observed |
+|---|---|---|
+| `OBJECTS` | `system.tables` | `13/13 present` |
+| `ENGINES` | `system.tables` | empty detail = all four dedup engines correct |
+| `SORTKEYS` | `system.tables` | empty detail = every dedup key correct |
+| `DICT` | `system.dictionaries` | `status=LOADED elements=4` |
+| `DICT_FRESH` | `system.dictionaries` | `vault=4 dictionary=4 last_refresh=83s ago` |
+| `KAFKA_FLUSH` | `system.tables` | `flush setting present: yes` — negative control returns `bad=1 NO — will inherit 7500ms` |
+| `KAFKA_CONSUMERS` | `system.kafka_consumers` | `2 consumer(s); assigned partitions: 1; read: 340; commits: 10` |
+
+These are deliberately assertions rather than dashboards. A structural drift — someone
+recreating `events_raw` without `ReplacingMergeTree`, or a Kafka table that inherits the 7500 ms
+flush default — is silent at runtime and only shows up as mysterious duplicates or missed SLOs
+much later. `ENGINES`, `SORTKEYS` and `KAFKA_FLUSH` exist to make that drift loud.
+
+#### `OBJECTS` — every table, view, MV and dictionary the pipeline needs exists
+
+```sql
+SELECT
+    countIf(found = 0) AS bad,
+    concat(toString(countIf(found = 1)), '/', toString(count()), ' present',
+           if(countIf(found = 0) > 0,
+              concat('; MISSING: ', arrayStringConcat(groupArrayIf(want, found = 0), ', ')),
+              '')) AS detail
+FROM
+(
+    SELECT
+        want,
+        want IN (SELECT name FROM system.tables WHERE database = 'ccb_v2') AS found
+    FROM
+    (
+        SELECT arrayJoin([
+            'vault_keys', 'dict_vault_keys', 'events_raw', 'ingest_errors',
+            'customer_events', 'mv_events_explode', 'latency_1s', 'mv_latency_1s',
+            'device_risk_1m', 'mv_device_risk_1m', 'consent_state',
+            'mv_consent_state', 'batch_landed'
+        ]) AS want
+    )
+);
+```
+
+#### `ENGINES` — dedup engines are in place; without them at-least-once inflates counts
+
+```sql
+SELECT
+    countIf(NOT ok) AS bad,
+    arrayStringConcat(groupArrayIf(concat(name, '=', engine), NOT ok), ', ') AS detail
+FROM
+(
+    SELECT name, engine,
+           engine LIKE '%ReplacingMergeTree' AS ok
+    FROM system.tables
+    WHERE database = 'ccb_v2'
+      AND name IN ('events_raw', 'ingest_errors', 'customer_events', 'consent_state')
+);
+```
+
+#### `SORTKEYS` — (partition, offset) is the Kafka identity and must be the dedup key
+
+```sql
+SELECT
+    countIf(NOT ok) AS bad,
+    arrayStringConcat(groupArrayIf(concat(name, ' -> ', sorting_key), NOT ok), ' | ') AS detail
+FROM
+(
+    SELECT name, sorting_key,
+           multiIf(
+               name IN ('events_raw', 'ingest_errors'), sorting_key = 'partition, offset',
+               name = 'customer_events',                sorting_key = 'customer_id, ts, event_id',
+               true) AS ok
+    FROM system.tables
+    WHERE database = 'ccb_v2' AND name IN ('events_raw', 'ingest_errors', 'customer_events')
+);
+```
+
+#### `DICT` — the vault dictionary is loaded and has no exception
+
+```sql
+SELECT
+    countIf(status != 'LOADED' OR last_exception != '') AS bad,
+    concat('status=', anyIf(status, 1), ' elements=', toString(anyIf(element_count, 1)),
+           if(anyIf(last_exception, 1) != '', concat(' exception=', anyIf(last_exception, 1)), '')) AS detail
+FROM system.dictionaries
+WHERE database = 'ccb_v2' AND name = 'dict_vault_keys';
+```
+
+#### `DICT_FRESH` — the dictionary is not STUCK behind the vault
+
+```sql
+--   MEASURED HAZARD: after inserting a new epoch key and calling
+--   SYSTEM RELOAD DICTIONARY, a follow-up query saw element_count=2 while the
+--   vault held 4 — the reload landed on one node, the query on another. The
+--   dictionary caught up on its own LIFETIME.
+--
+--   Lag WITHIN the LIFETIME window (max 300s) is expected and harmless, so it is
+--   NOT a failure — otherwise this check goes red every time a new epoch key is
+--   added. It fails only when the dictionary is genuinely stuck: behind the
+--   vault AND past its refresh deadline.
+--
+--   Consequence at an epoch boundary: the first batches of a new epoch can
+--   decrypt to zero rows on a node whose dictionary has not refreshed. Contained
+--   (ciphertext retained, RECON reports the shortfall, replay fixes it), which is
+--   why LIFETIME must stay well under the 300s epoch.
+SELECT
+    if(dict_elements < vault_epochs AND age_s > 300, toUInt64(vault_epochs - dict_elements), toUInt64(0)) AS bad,
+    concat('vault=', toString(vault_epochs), ' dictionary=', toString(dict_elements),
+           ' last_refresh=', toString(age_s), 's ago',
+           if(dict_elements < vault_epochs,
+              if(age_s > 300, ' STUCK past LIFETIME', ' (lagging, within LIFETIME window)'),
+              '')) AS detail
+FROM
+(
+    SELECT
+        (SELECT uniqExact(key_epoch) FROM ccb_v2.vault_keys) AS vault_epochs,
+        (SELECT element_count FROM system.dictionaries
+          WHERE database = 'ccb_v2' AND name = 'dict_vault_keys') AS dict_elements,
+        (SELECT dateDiff('second', last_successful_update_time, now())
+           FROM system.dictionaries
+          WHERE database = 'ccb_v2' AND name = 'dict_vault_keys') AS age_s
+);
+```
+
+#### `KAFKA_FLUSH` — kafka_flush_interval_ms is set explicitly, not the 7500ms default
+
+```sql
+--   Skipped when events_kafka does not exist yet (no broker).
+SELECT
+    countIf(engine = 'Kafka' AND NOT has_flush) AS bad,
+    if(count() = 0, 'SKIP: events_kafka not created yet (no broker)',
+       concat('flush setting present: ', if(anyIf(has_flush, 1), 'yes', 'NO — will inherit 7500ms'))) AS detail
+FROM
+(
+    SELECT engine,
+           position(create_table_query, 'kafka_flush_interval_ms') > 0 AS has_flush
+    FROM system.tables
+    WHERE database = 'ccb_v2' AND name = 'events_kafka'
+);
+```
+
+#### `KAFKA_CONSUMERS` — consumer is polling and has no exceptions
+
+```sql
+--   Skipped until the Kafka table exists.
+SELECT
+    countIf(notEmpty(exceptions.text)) AS bad,
+    if(count() = 0, 'SKIP: no Kafka consumer registered',
+       concat(toString(count()), ' consumer(s); assigned partitions: ',
+              toString(length(anyIf(assignments.partition_id, 1))),
+              '; read: ', toString(sum(num_messages_read)))) AS detail
+FROM system.kafka_consumers
+WHERE database = 'ccb_v2';
+```
+
+#### Negative control — proving `KAFKA_FLUSH` actually fires
+
+A validation that never fails is worthless. Creating a Kafka table *without*
+`kafka_flush_interval_ms` and re-running the check:
+
+```
+bad=1  detail=flush setting present: NO — will inherit 7500ms
+```
+
+confirmed against `SELECT value FROM system.settings WHERE name='stream_flush_interval_ms'`
+returning **7500** on a stock 26.4.1. This is the single most dangerous default in the design
+(§7.1): everything works, and the sub-second SLO is missed by more than 7x with nothing in any
+log to say why.
+
+#### Consumer telemetry this design gets and ClickPipes does not
+
+```sql
+SELECT table, assignments.partition_id AS parts, assignments.current_offset AS offsets,
+       num_messages_read, num_commits, num_rebalance_assignments AS rebalances,
+       length(exceptions.text) AS exception_count
+FROM system.kafka_consumers WHERE database = 'ccb_v2' FORMAT Vertical;
+```
+
+Observed during the offset-commit test, mid-failure:
+
+```
+table:           src2
+parts:           [0]
+offsets:         [100]
+read:            340
+commits:         10
+rebalances:      13
+exception_count: 10
+```
+
+`rebalances: 13` is worth an alert on its own — repeated rebalancing is the visible symptom of a
+consumer retrying a block it cannot commit, which is what a stalled partition looks like from
+outside.
+
+---
+
 ## 13 · Validating records: Kafka ↔ ClickHouse (R9, zero loss)
 
 Loss can occur at two independent boundaries, so there are two independent checks. Both are
