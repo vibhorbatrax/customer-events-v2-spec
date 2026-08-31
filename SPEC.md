@@ -5,7 +5,7 @@
 A second-generation customer-event pipeline for the Meridian demo: 20,000 events/s from
 Amazon MSK into ClickHouse Cloud via the **Kafka engine table**, nested-JSON payloads
 encrypted **per batch** under a 5-minute rotating vault key, decrypted inside ClickHouse,
-queried live through JSON paths and array junctions, with a **p99 < 1s** budget from MSK
+queried live through JSON paths and array functions, with a **p99 < 1s** budget from MSK
 produce to Meridian API response.
 
 This does not modify the existing `ccb_demo` tables or the running demo. It builds a
@@ -17,7 +17,7 @@ parallel `ccb_v2` database so the current CCB story keeps working during develop
 
 **What.** A parallel `ccb_v2` customer-event pipeline: Amazon MSK → ClickHouse Kafka engine
 table → nested-JSON events decrypted inside ClickHouse → live queries over JSON paths and
-array junctions → Meridian API and UI. The existing `ccb_demo` demo is untouched.
+array functions → Meridian API and UI. The existing `ccb_demo` demo is untouched.
 
 **The five things that make it interesting**
 
@@ -812,8 +812,22 @@ Related verified defaults: `kafka_max_wait_ms = 5000`, `stream_poll_timeout_ms =
 
 ## 8 · Query patterns
 
+Two distinct capabilities over the nested payload, and the distinction matters:
+
+| | Mechanism | Cardinality | Use when |
+|---|---|---|---|
+| **Array functions** | `arrayMap`, `arrayFilter`, `arrayExists`, `arrayReduce`, … | **1 row in → 1 row out** | asking a question *about* an array |
+| **`ARRAY JOIN`** | clause, or the `arrayJoin()` function | 1 row in → N rows out | you need each element as its own row |
+
+Array functions are the default. They keep one row per event, so no fan-out and no
+double-counting when you aggregate. `ARRAY JOIN` is for when an element genuinely has to
+become a row — a flattened projection, or exploding a decrypted batch.
+
+Every query below was executed against the running pipeline; the stated results are real.
+
+### 8.1 Dynamic JSON paths
+
 ```sql
--- 8.1 dynamic JSON paths, no schema change needed
 SELECT customer_id, ts,
        payload.device.attestation.risk  AS attest_risk,
        payload.geo.is_proxy             AS via_proxy,
@@ -821,31 +835,129 @@ SELECT customer_id, ts,
 FROM ccb_v2.customer_events
 WHERE customer_id = {customer:String} AND ts >= now() - INTERVAL 15 MINUTE
 ORDER BY ts DESC LIMIT 50;
+```
 
--- 8.2 array junction: which consents changed alongside a new device
+No schema change is needed when a producer adds a field — it simply appears as a new path.
+
+### 8.2 Array functions — the primary pattern
+
+**A JSON array path needs the `[]` suffix** (`payload.consents[]`, not `payload.consents`), or
+it does not resolve as an array.
+
+**Predicates need an explicit cast.** JSON subpaths are `Dynamic`, and a lambda must return
+`UInt8`. A numeric comparison is fine because the comparison itself yields a boolean, but a bare
+boolean field is not:
+
+```sql
+-- FAILS: "Expression for function arrayCount must return UInt8 or Nullable(UInt8)"
+arrayCount(x -> x.granted, payload.consents[])
+-- WORKS
+arrayCount(x -> toBool(x.granted), payload.consents[])
+arrayCount(x -> x.granted = true, payload.consents[])
+-- WORKS without a cast: the comparison produces the boolean
+arrayExists(x -> toFloat64(x.trust) < 0.15, payload.devices_seen_30d[])
+```
+
+Verified working directly on JSON array paths: `length`, `arrayMap`, `arrayFilter`,
+`arrayExists`, `arrayAll`, `arrayCount`, `arraySum`, `arrayMin`, `arrayMax`, `arraySort`,
+`arrayFirst`, `arrayZip`, `arrayReduce`, `arrayStringConcat`, `has`.
+
+**Per-event analytics with no row multiplication:**
+
+```sql
+SELECT
+    count()                                                                        AS events,
+    countIf(arrayExists(x -> toFloat64(x.trust) < 0.15, payload.devices_seen_30d[])) AS has_untrusted_device,
+    countIf(arrayAll(x -> NOT toBool(x.granted), payload.consents[]))               AS all_consents_revoked,
+    round(avg(arrayReduce('avg',
+        arrayMap(x -> toFloat64(x.trust), payload.devices_seen_30d[]))), 3)         AS avg_device_trust,
+    round(avg(arrayCount(x -> toBool(x.granted), payload.consents[])), 2)           AS avg_granted_consents
+FROM ccb_v2.customer_events;
+```
+
+Observed over 19,200 events: `has_untrusted_device = 5,262`, `all_consents_revoked = 4,782`,
+`avg_device_trust = 0.501`. **19,200 rows scanned, 19,200 rows out** — the equivalent
+`ARRAY JOIN` formulation would have produced 38,400+ and required `uniqExact(event_id)` to
+avoid double-counting.
+
+**Reaching into an element without flattening:**
+
+```sql
+-- the current address, as a scalar, one row per event
+SELECT customer_id,
+       arrayFirst(x -> toBool(x.current), payload.addresses[]).city AS current_city,
+       arrayStringConcat(arrayMap(x -> toString(x.kind), payload.consents[]), ', ') AS consents,
+       arraySort(x -> toFloat64(x.trust), payload.devices_seen_30d[])[1].id         AS least_trusted_device,
+       arrayZip(arrayMap(x -> toString(x.id),        payload.devices_seen_30d[]),
+                arrayMap(x -> toFloat64(x.trust),    payload.devices_seen_30d[]))   AS device_trust_pairs
+FROM ccb_v2.customer_events
+WHERE customer_id = {customer:String}
+ORDER BY ts DESC LIMIT 20;
+```
+
+`arrayZip` pairs two arrays **element-wise** — distinct from `ARRAY JOIN`ing both, which would
+give a cross product.
+
+**Cross-array conditions in a single predicate** — the takeover shape without any fan-out:
+
+```sql
+SELECT customer_id, ts, ato_score
+FROM ccb_v2.customer_events
+WHERE arrayExists(x -> toFloat64(x.trust) < 0.1, payload.devices_seen_30d[])
+  AND arrayCount(x -> toBool(x.granted), payload.consents[]) = 0
+  AND arrayFirst(x -> toBool(x.current), payload.addresses[]).country != 'US'
+ORDER BY ato_score DESC LIMIT 25;
+```
+
+### 8.3 `ARRAY JOIN` — when an element must become a row
+
+Two legitimate uses remain.
+
+**A flattened projection**, for querying consent state as a first-class table (§6.6):
+
+```sql
 SELECT c.kind, countIf(device_is_new) AS on_new_device, count() AS total
 FROM ccb_v2.customer_events
 ARRAY JOIN payload.consents[] AS c
-WHERE ts >= now() - INTERVAL 1 HOUR
 GROUP BY c.kind ORDER BY on_new_device DESC;
+```
 
--- 8.3 double junction: device trust × address history in one statement
-SELECT customer_id,
-       d.id AS device, d.trust AS trust,
-       a.city AS city, a.since AS since
+**Exploding a decrypted batch** — the `arrayJoin()` *function* form, which is what turns one
+ciphertext into 100 event rows and delivers the 100× decrypt amortisation (§6.4):
+
+```sql
+arrayJoin(JSONExtractArrayRaw(plain, 'events')) AS ev
+```
+
+Two independent `ARRAY JOIN`s produce a **cross product**, which is occasionally what you want
+and often a trap — 2 devices × 2 addresses = 4 rows per event:
+
+```sql
+SELECT d.id AS device, d.trust, a.city, a.current
 FROM ccb_v2.customer_events
 ARRAY JOIN payload.devices_seen_30d[] AS d
 ARRAY JOIN payload.addresses[]        AS a
-WHERE customer_id = {customer:String} AND a.current AND d.trust < 0.1;
+WHERE event_id = {event_id:String};
+```
 
--- 8.4 relationship fan-out: a takeover that spreads to joint holders
+If you only need a *condition* across two arrays rather than the pairs themselves, use the
+array-function form in §8.2 — same answer, no multiplication.
+
+### 8.4 Relationship fan-out
+
+Genuinely needs `ARRAY JOIN`, because each related customer must become its own row to group on:
+
+```sql
 SELECT r.customer_id AS related, r.kind, count() AS events, max(ato_score) AS peak_ato
 FROM ccb_v2.customer_events
 ARRAY JOIN payload.relationships[] AS r
 WHERE cohort = 'takeover' AND ts >= now() - INTERVAL 6 HOUR
 GROUP BY related, r.kind HAVING peak_ato > 0.8 ORDER BY peak_ato DESC LIMIT 25;
+```
 
--- 8.5 the SLO, read from the MV
+### 8.5 The SLO, read from the MV
+
+```sql
 SELECT second,
        quantileTDigestMerge(0.50)(p50_state) AS p50_ms,
        quantileTDigestMerge(0.99)(p99_state) AS p99_ms,
@@ -854,9 +966,6 @@ FROM ccb_v2.latency_1s
 WHERE second >= now() - INTERVAL 5 MINUTE
 GROUP BY second ORDER BY second DESC;
 ```
-
-Note the `[]` suffix on JSON array paths — `ARRAY JOIN payload.consents[]`. Verified on
-26.4.1; without it the path does not resolve as an array.
 
 ---
 
@@ -895,7 +1004,7 @@ All of this lands in the existing **Customer Events** vertical (`vertical: 'cust
   and a decrypt-failure counter (should be 0).
 * MSK partition lag, 24 bars.
 
-**10.2 Query Library — new bucket "Nested JSON & Array Junctions"**
+**10.2 Query Library — new bucket "Nested JSON & Array Functions"**
 Showcases for §8.1–8.5, each with `viz` specs. Registered as
 `{ id: 'ce-json-*', vertical: 'customer-events', category: 'Nested JSON · arrays' }`, plus
 a `BUCKETS` entry in `web/src/components/ShowcasePage.jsx`.
@@ -1582,7 +1691,7 @@ assumed. Items *not* verified are called out in §14.2.
 | `encrypt → tryDecrypt → JSONExtractArrayRaw → arrayJoin → ARRAY JOIN` | 3 rows from a 2-event batch with 3 nested devices |
 | `tryDecrypt` returns `Nullable(String)` | **breaks array functions** — must `ifNull` unwrap |
 | Native `JSON` cast + dynamic paths (`j.customer.risk.score`) | works |
-| JSON array junction `ARRAY JOIN j.devices[] AS d` | works; **`[]` suffix required** |
+| JSON array function `ARRAY JOIN j.devices[] AS d` | works; **`[]` suffix required** |
 | `toStartOfInterval(now(), INTERVAL 300 SECOND)` epoch | `1787943000` |
 
 **Offset-commit ordering — the zero-loss linchpin (Redpanda + ClickHouse 26.4.1 and 26.8.1)**
